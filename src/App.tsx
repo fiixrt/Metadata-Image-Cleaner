@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
-import { Upload, Download, X, Github, Trash2, RotateCcw, RotateCw, Clipboard, FileJson } from 'lucide-react';
+import { Upload, Download, X, Github, Trash2, RotateCcw, RotateCw, Clipboard, FileJson, Wand2 } from 'lucide-react';
 import exifr from 'exifr';
+import { removeBackground } from '@imgly/background-removal';
 
 interface ExifData {
   [key: string]: any;
@@ -25,6 +26,7 @@ function App() {
   const [futureHistory, setFutureHistory] = useState<HistoryState[]>([]);
   const [notification, setNotification] = useState<string | null>(null);
   const [showJsonModal, setShowJsonModal] = useState(false);
+  const [processType, setProcessType] = useState<'metadata' | 'background' | null>(null);
 
   const showNotification = (message: string) => {
     setNotification(message);
@@ -113,64 +115,65 @@ function App() {
   };
 
   const extractMetadata = async (file: File): Promise<ExifData> => {
-    const metadata: ExifData = {
-      'File Info': {
-        'File Name': file.name,
-        'File Size': `${(file.size / 1024).toFixed(2)} KB`,
-        'File Type': file.type,
-        'Last Modified': new Date(file.lastModified).toLocaleString(),
-      }
-    };
-
     try {
-      const allMetadata = await exifr.parse(file, {
+      const metadata: ExifData = {};
+
+      metadata['File Name'] = file.name;
+      metadata['File Size'] = `${(file.size / 1024).toFixed(2)} KB`;
+      metadata['File Type'] = file.type;
+      metadata['Last Modified'] = new Date(file.lastModified).toLocaleString();
+
+      const exifData = await exifr.parse(file, {
         tiff: true,
         exif: true,
         gps: true,
+        interop: true,
+        ifd0: true,
+        ifd1: true,
         iptc: true,
+        xmp: true,
         icc: true,
         jfif: true,
         ihdr: true,
-        xmp: true,
-        ifd0: true,
-        ifd1: true,
-        interop: true,
-        makerNote: true,
-        userComment: true,
-        translateKeys: true,
-        translateValues: true,
-        reviveValues: true,
-        sanitize: false,
-        mergeOutput: false,
+        png: true,
+        heif: true,
       });
 
-      if (allMetadata) {
-        if (allMetadata.ifd0) metadata['IFD0'] = allMetadata.ifd0;
-        if (allMetadata.ifd1) metadata['IFD1'] = allMetadata.ifd1;
-        if (allMetadata.exif) metadata['EXIF'] = allMetadata.exif;
-        if (allMetadata.gps) metadata['GPS'] = allMetadata.gps;
-        if (allMetadata.iptc) metadata['IPTC'] = allMetadata.iptc;
-        if (allMetadata.icc) metadata['ICC Profile'] = allMetadata.icc;
-        if (allMetadata.jfif) metadata['JFIF'] = allMetadata.jfif;
-        if (allMetadata.ihdr) metadata['PNG IHDR'] = allMetadata.ihdr;
-        if (allMetadata.xmp) metadata['XMP'] = allMetadata.xmp;
-        if (allMetadata.tiff) metadata['TIFF'] = allMetadata.tiff;
-        if (allMetadata.interop) metadata['Interoperability'] = allMetadata.interop;
-        if (allMetadata.makerNote) metadata['Maker Note'] = allMetadata.makerNote;
+      if (exifData) {
+        Object.assign(metadata, exifData);
       }
 
-      const thumbnail = await exifr.thumbnail(file);
-      if (thumbnail) {
-        metadata['Embedded Thumbnail'] = {
-          'Has Thumbnail': true,
-          'Size': `${thumbnail.byteLength} bytes`,
+      const img = new Image();
+      const imageUrl = URL.createObjectURL(file);
+      await new Promise((resolve) => {
+        img.onload = () => {
+          metadata['Image Width'] = img.width;
+          metadata['Image Height'] = img.height;
+          metadata['Dimensions'] = `${img.width}x${img.height}`;
+          URL.revokeObjectURL(imageUrl);
+          resolve(null);
         };
-      }
-    } catch (error) {
-      metadata['Extraction Error'] = String(error);
-    }
+        img.onerror = () => {
+          URL.revokeObjectURL(imageUrl);
+          resolve(null);
+        };
+        img.src = imageUrl;
+      });
 
-    return metadata;
+      if (Object.keys(metadata).length <= 5) {
+        metadata['Note'] = 'No EXIF/IPTC/XMP metadata found in this image';
+      }
+
+      return metadata;
+    } catch (error) {
+      console.error('Error extracting metadata:', error);
+      return {
+        'File Name': file.name,
+        'File Size': `${(file.size / 1024).toFixed(2)} KB`,
+        'File Type': file.type,
+        'Error': 'Could not extract metadata from this file',
+      };
+    }
   };
 
   const handleImageFile = async (file: File) => {
@@ -195,6 +198,7 @@ function App() {
 
     saveToHistory();
     setIsProcessing(true);
+    setProcessType('metadata');
     const img = new Image();
 
     img.onload = () => {
@@ -231,7 +235,17 @@ function App() {
     if (!processedImage) return;
 
     const link = document.createElement('a');
-    const fileName = originalFileName.replace(/\.[^/.]+$/, '') + '_clean.jpg';
+    const baseName = originalFileName.replace(/\.[^/.]+$/, '');
+    let fileName: string;
+
+    if (processType === 'background') {
+      fileName = baseName + '-backgroundremoved.png';
+    } else if (processType === 'metadata') {
+      fileName = baseName + '-cleaned.jpg';
+    } else {
+      fileName = baseName + '-processed.png';
+    }
+
     link.href = processedImage;
     link.download = fileName;
     link.click();
@@ -300,11 +314,65 @@ function App() {
     }
   };
 
+  const handleRemoveBackground = async () => {
+    if (!originalImage) return;
+
+    saveToHistory();
+    setIsProcessing(true);
+    setProcessType('background');
+
+    try {
+      const blob = await fetch(originalImage).then(r => r.blob());
+      const result = await removeBackground(blob, {
+        debug: false,
+        quality: 'preview',
+        type: 'image/png',
+      });
+
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('Could not get canvas context');
+
+      const img = new Image();
+      const resultUrl = URL.createObjectURL(result);
+
+      await new Promise<void>((resolve, reject) => {
+        img.onload = () => {
+          canvas.width = img.width;
+          canvas.height = img.height;
+          ctx.drawImage(img, 0, 0);
+
+          canvas.toBlob((outputBlob) => {
+            if (outputBlob) {
+              const url = URL.createObjectURL(outputBlob);
+              setProcessedImage(url);
+              URL.revokeObjectURL(resultUrl);
+            }
+            resolve();
+          }, 'image/png', 1.0);
+        };
+        img.onerror = () => {
+          URL.revokeObjectURL(resultUrl);
+          reject(new Error('Failed to load processed image'));
+        };
+        img.src = resultUrl;
+      });
+
+      showNotification('Background removed successfully');
+    } catch (error) {
+      console.error('Error removing background:', error);
+      showNotification('Error removing background');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
   const handleReset = () => {
     setProcessedImage(null);
     setOriginalImage(null);
     setOriginalFileName('');
     setMetadata(null);
+    setProcessType(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -439,30 +507,50 @@ function App() {
                     </button>
                   )}
 
-                  <div className="flex flex-col sm:flex-row gap-4">
+                  <div className="flex flex-col gap-4">
+                    <div className="flex flex-col sm:flex-row gap-4">
+                      <button
+                        onClick={handleDownloadOriginal}
+                        className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-200 font-medium py-3 px-6 rounded-lg transition-colors flex items-center justify-center gap-2 text-sm"
+                      >
+                        <Download className="w-5 h-5" />
+                        <span className="hidden sm:inline">Download Original</span>
+                        <span className="sm:hidden">Download</span>
+                      </button>
+                      <button
+                        onClick={handleCleanMetadata}
+                        disabled={isProcessing}
+                        className="flex-1 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-600 text-white font-medium py-3 px-6 rounded-lg transition-all duration-200 flex items-center justify-center gap-2 text-sm"
+                      >
+                        {isProcessing ? (
+                          <>
+                            <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
+                            <span className="hidden sm:inline">Cleaning...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Trash2 className="w-5 h-5" />
+                            <span className="hidden sm:inline">Remove All Metadata</span>
+                            <span className="sm:hidden">Clean</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
                     <button
-                      onClick={handleDownloadOriginal}
-                      className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-200 font-medium py-3 px-6 rounded-lg transition-colors flex items-center justify-center gap-2 text-sm"
-                    >
-                      <Download className="w-5 h-5" />
-                      <span className="hidden sm:inline">Download Original</span>
-                      <span className="sm:hidden">Download</span>
-                    </button>
-                    <button
-                      onClick={handleCleanMetadata}
+                      onClick={handleRemoveBackground}
                       disabled={isProcessing}
-                      className="flex-1 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-600 text-white font-medium py-3 px-6 rounded-lg transition-all duration-200 flex items-center justify-center gap-2 text-sm"
+                      className="w-full bg-blue-700 hover:bg-blue-600 disabled:bg-blue-800 text-white font-medium py-3 px-6 rounded-lg transition-all duration-200 flex items-center justify-center gap-2 text-sm"
                     >
                       {isProcessing ? (
                         <>
                           <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
-                          <span className="hidden sm:inline">Cleaning...</span>
+                          <span className="hidden sm:inline">Removing background...</span>
                         </>
                       ) : (
                         <>
-                          <Trash2 className="w-5 h-5" />
-                          <span className="hidden sm:inline">Remove All Metadata</span>
-                          <span className="sm:hidden">Clean</span>
+                          <Wand2 className="w-5 h-5" />
+                          <span className="hidden sm:inline">Remove Background</span>
+                          <span className="sm:hidden">Remove BG</span>
                         </>
                       )}
                     </button>
